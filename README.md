@@ -28,9 +28,13 @@ A custom Unix shell for Linux, written from scratch in Rust. Built for CachyOS, 
 
 - Pipelines: `cmd1 | cmd2 | cmd3`
 
-- Redirection: `<`, `>`, `>>`
+- Redirection: `<`, `>`, `>>`, `2>`, `2>>`, `2>&1`, `&>` — including `2>&1` genuinely merging stderr into a pipeline
 
-- Aliases: `alias name=value`, `unalias name`, listing with bare `alias`
+- Variable expansion: `$VAR` / `${VAR}` (suppressed inside single quotes), shell variables via bare `name=value` assignments; an unquoted expansion that comes out empty vanishes from the command's arguments, bash-style (`echo A $UNSET B` prints `A B`)
+
+- Filename globbing: `*`, `?`, `[abc]`, `[a-z]`, `[!...]`, including subdirectory patterns (`src/*.rs`) and trailing `/` for dirs-only; dotfiles need an explicit leading `.`; unmatched patterns stay literal; quoted wildcards never expand
+
+- Aliases: `alias name=value`, `unalias name`, listing with bare `alias`; alias values may contain full operator chains (`&&`, `||`, `;`, pipes, redirects) and are executed as real parsed syntax, with fish-style `$argv` argument insertion
 
 - Fish-style function files: `~/.config/lush/functions/<name>.lush`, using `function name --wraps=... --description '...'` / body / `end` syntax, with `$argv` for argument passthrough
 
@@ -39,6 +43,12 @@ A custom Unix shell for Linux, written from scratch in Rust. Built for CachyOS, 
 - `source path` / `. path` — re-run a script file on demand
 
 - `~/.lushrc` — startup config, runs through the same execution path as interactive input
+
+- Builtins accept output redirection: stdout (`pwd > out.txt`) and stderr (`cd /nonexistent 2> err.log`, including `2>>` and `2>&1`)
+
+- `exit [n]` unwinds cleanly — history is saved and the process exits with status `n` (0 by default)
+
+- `cd -` jumps to the previous directory via `$OLDPWD`; `$PWD`/`$OLDPWD` are tracked
 
 - Implicit `cd` — typing a bare path (`..`, `../..`, `subdir/child`, `~/Projects`) changes into it directly, no `cd` needed
 
@@ -60,7 +70,7 @@ A custom Unix shell for Linux, written from scratch in Rust. Built for CachyOS, 
 
 
 
-`cd`, `exit`, `alias`, `unalias`, `source` / `.`, `funcsave`
+`cd`, `pwd`, `exit`, `alias`, `unalias`, `source` / `.`, `funcsave`, `export`, `unset`
 
 
 
@@ -75,23 +85,9 @@ These are real, currently-present gaps, not hypothetical edge cases:
 
 
 
-- **Pipe detection is quote-unaware.** `echo "hello | world"` is currently mis-parsed as a two-stage pipeline, because pipe-splitting happens via a blind `str::split('|')` before quotes are considered. *(Fix in progress — see [Architecture](#architecture) below.)*
-
-- **Redirection operators require whitespace.** `echo hello>out.txt` (no space) does not work today; only `echo hello > out.txt` does. *(Also being fixed by the same work.)*
-
 - **No backslash escaping.** There's no way to escape a quote or space character within a word.
 
-- **No environment/shell variable expansion.** `$HOME`, `$USER`, `${VAR}` are not expanded, they're passed through as literal text.
-
-- **No `export` / `unset`.** No way to set environment variables for child processes from within Lush.
-
-- **`cd` is minimal.** No `cd -` (previous directory), no `$OLDPWD`/`$PWD` tracking.
-
-- **No `pwd` builtin.**
-
-- **Builtins don't support redirection.** `pwd > out.txt` won't work, only external commands currently respect `<`/`>`/`>>`.
-
-- **No stderr redirection.** `2>`, `2>>`, `2>&1`, `&>` are not supported.
+- **Operator-bearing aliases can't run inside a pipeline.** `alias gs='git status && git diff'` works fine standalone, but `gs | head` is rejected with an explicit error — there are no subshells yet to give a multi-command chain somewhere coherent to live between two pipe stages.
 
 - **No `history` builtin.** History is recorded and used for autosuggestions, but can't be listed or searched from within the shell beyond whatever `rustyline` provides by default.
 
@@ -111,8 +107,6 @@ These are real, currently-present gaps, not hypothetical edge cases:
 
 - **No scripting constructs.** No `if`, `for`, `while`.
 
-- **No glob expansion.** `*`, `?`, `[abc]` are not expanded.
-
 - **No command substitution.** `$(...)` is not supported.
 
 - **Single-quote handling can surprise you mid-sentence.** Since `'` now opens a real quote (needed to parse `--description '...'` in function files), an unescaped apostrophe — e.g. `echo don't stop` — will swallow the rest of the line into one token rather than erroring, the same way bash behaves in that situation. Worth knowing if output looks wrong on a command containing a contraction.
@@ -127,26 +121,33 @@ These are real, currently-present gaps, not hypothetical edge cases:
 
 
 
-Lush is mid-transition from an ad hoc parser to a proper one:
+Lush runs on a real lexer/parser/AST pipeline, end to end:
 
 
 
 
 ```
 
-Input → Lexer → Tokens → Parser → AST → Executor
+Input → Lexer → Parser → AST → Executor
 
 ```
 
 
 
 
-**Current state:** the lexer (`src/lib.rs`, `lex()`) exists and is unit-tested, but is **not yet wired into execution**. `src/main.rs` still runs on the original implementation: `tokenize()`, `split_chain()`, and a raw `split('|')` for pipelines. This is deliberate — the new lexer/parser/executor pipeline is being built and verified incrementally, one checkpoint at a time, before it replaces the code paths currently in production use.
+Every input line — typed interactively, sourced from a script, loaded from `~/.lushrc`, even an alias's own value at invocation time — goes through the same path. `lex()` tokenizes quote-aware (a `|` inside quotes stays literal text), `parse()` builds an AST (`Command` / `Pipeline` / `And` / `Or` / `Sequence`, with per-command redirects), and the executor in `src/main.rs` walks that tree, propagating exit statuses through short-circuit chains and pipelines.
+
+Split of responsibilities:
+
+- `src/lib.rs` — lexer, parser, AST types, variable expansion (`expand_word`), assignment detection (`parse_assignment`). All pure functions, directly unit-tested.
+- `src/main.rs` — the executor (`exec_node` / `exec_simple_command` / `exec_pipeline`), builtins, alias expansion, prompt/history/line-editor glue.
+
+Alias expansion is AST-level too: invoking an alias parses its value into a subtree that replaces the invocation in the tree (arguments spliced fish-style at `$argv`, or appended to the chain's last command; site redirects land on that same last command). That's what makes operator-bearing aliases work; it's also why they're one-level only by construction — the expanded subtree executes with alias lookup disabled — and why an operator-bearing alias can't be invoked *inside* a pipeline (no subshells yet), which errors loudly instead of misbehaving quietly.
 
 
 
 
-Planned AST shape (not yet implemented):
+The AST shape:
 
 
 
@@ -322,7 +323,13 @@ cargo test
 
 
 
-Lexer/parser tests live in `src/lib.rs` as the new parsing pipeline is built out. Add regression tests for parser behavior before relying on it in the executor, per the project's own engineering guidelines.
+Three layers, all run by `cargo test`:
+
+- Lexer/parser/expansion unit tests in `src/lib.rs`
+- Alias tree-manipulation unit tests in `src/main.rs`
+- A black-box integration suite in `tests/integration.rs` that spawns the built binary with an isolated `$HOME`, feeds it scripted stdin, and asserts on stdout/stderr/exit codes
+
+Add regression tests for parser behavior before relying on it in the executor, per the project's own engineering guidelines.
 
 
 
@@ -337,9 +344,9 @@ Rough phase breakdown, in priority order. Not all of this will land quickly, and
 
 
 
-- **Phase 1 — Foundation**: lexer/parser/AST, port existing syntax onto it, parser tests, verify no regressions
+- **Phase 1 — Foundation** *(complete)*: lexer/parser/AST, port existing syntax onto it, parser tests, verify no regressions
 
-- **Phase 2 — Shell fundamentals**: `$VAR`/`${VAR}` expansion, shell variables, `export`/`unset`, `pwd`, `cd -`, `$PWD`/`$OLDPWD`, proper redirection parsing (including `2>`, `&>`), builtin redirection
+- **Phase 2 — Shell fundamentals** *(nearly complete — remaining: builtin stderr redirection, temporary per-command env assignments)*: `$VAR`/`${VAR}` expansion, shell variables, `export`/`unset`, `pwd`, `cd -`, `$PWD`/`$OLDPWD`, proper redirection parsing (including `2>`, `&>`), builtin redirection
 
 - **Phase 3 — Interactive quality**: `history`, `help`, `type`, `which`/`command -v`, completion aware of builtins/aliases/functions/`$PATH`, better history search (`Ctrl+R`, prefix-aware), configurable prompt, optional git-aware prompt segment
 
